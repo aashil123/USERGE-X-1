@@ -1,73 +1,204 @@
-"""Fun plugin"""
+# Copyright (C) 2020 by UsergeTeam@Github, < https://github.com/UsergeTeam >.
+#
+# This file is part of < https://github.com/UsergeTeam/Userge > project,
+# and is released under the "GNU v3.0 License Agreement".
+# Please see < https://github.com/uaudith/Userge/blob/master/LICENSE >
+#
+# All rights reserved.
 
+import re
+import os
 import asyncio
-from re import search
+from typing import Tuple, Optional
 
-from pyrogram import filters
-from pyrogram.errors import BadRequest, Forbidden
-from pyrogram.types import CallbackQuery
+import wget
+from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton
+from pyrogram.errors import (
+    ChatSendMediaForbidden, Forbidden, SlowmodeWait, PeerIdInvalid,
+    FileIdInvalid, FileReferenceEmpty, BadRequest, ChannelInvalid, MediaEmpty
+)
 
-from userge import Config, Message, userge
+from userge.core.ext import RawClient
+from userge.utils import get_file_id_and_ref
+from userge import userge, Message, Config, versions, get_version, logging
+
+_LOG = logging.getLogger(__name__)
+
+_IS_TELEGRAPH = False
+_IS_STICKER = False
+
+_DEFAULT = "https://t.me/theUserge/31"
+_CHAT, _MSG_ID = None, None
+_LOGO_ID, _LOGO_REF = None, None
 
 
-@userge.on_cmd("alive", about={"header": "Just For Fun"}, allow_channels=False)
-async def alive_inline(message: Message):
-    bot = await userge.bot.get_me()
+@userge.on_cmd("alive", about={
+    'header': "This command is just for fun"}, allow_channels=False)
+async def alive(message: Message):
+    if not (_CHAT and _MSG_ID):
+        try:
+            _set_data()
+        except Exception as set_err:
+            _LOG.exception("There was some problem while setting Media Data. "
+                           f"trying again... ERROR:: {set_err} ::")
+            _set_data(True)
 
-    try:
-        x = await userge.get_inline_bot_results(bot.username, "alive")
-        y = await userge.send_inline_bot_result(
-            chat_id=message.chat.id, query_id=x.query_id, result_id=x.results[0].id
-        )
-    except (Forbidden, BadRequest) as ex:
-        return await message.err(str(ex), del_in=5)
-
+    alive_text, markup = _get_alive_text_and_markup(message)
+    if _MSG_ID == "text_format":
+        return await message.edit(alive_text, disable_web_page_preview=True, reply_markup=markup)
     await message.delete()
-    await asyncio.sleep(90)
-    await userge.delete_messages(message.chat.id, y.updates[0].id)
+    try:
+        await _send_alive(message, alive_text, markup)
+    except (FileIdInvalid, FileReferenceEmpty, BadRequest):
+        await _refresh_id(message)
+        await _send_alive(message, alive_text, markup)
 
 
-if userge.has_bot:
+def _get_mode() -> str:
+    if RawClient.DUAL_MODE:
+        return "Dual"
+    if Config.BOT_TOKEN:
+        return "Bot"
+    return "User"
 
-    @userge.bot.on_callback_query(filters.regex(pattern=r"^settings_btn$"))
-    async def alive_cb(_, callback_query: CallbackQuery):
-        if Config.HEROKU_APP:
-            dynos_saver = _parse_arg(Config.RUN_DYNO_SAVER)
-        else:
-            dynos_saver = "Not Supported"
-        alive_s = "• ➕ 𝗘𝘅𝘁𝗿𝗮 𝗣𝗹𝘂𝗴𝗶𝗻𝘀 : {}\n".format(
-            _parse_arg(Config.LOAD_UNOFFICIAL_PLUGINS)
-        )
-        alive_s += f"• 👥 𝗦𝘂𝗱𝗼 : {_parse_arg(Config.SUDO_ENABLED)}\n"
-        alive_s += f"• 🚨 𝗔𝗻𝘁𝗶𝘀𝗽𝗮𝗺 : {_parse_arg(Config.ANTISPAM_SENTRY)}\n"
-        alive_s += f"• ⛽️ 𝗗𝘆𝗻𝗼 𝗦𝗮𝘃𝗲𝗿 : {dynos_saver}\n"
-        alive_s += f"• 💬 𝗕𝗼𝘁 𝗙𝗼𝗿𝘄𝗮𝗿𝗱𝘀 : {_parse_arg(Config.BOT_FORWARDS)}\n"
-        alive_s += f"• 📝 𝗣𝗠 𝗟𝗼𝗴𝗴𝗲𝗿 : {_parse_arg(Config.PM_LOGGING)}"
-        await callback_query.answer(alive_s, show_alert=True)
+
+def _get_alive_text_and_markup(message: Message) -> Tuple[str, Optional[InlineKeyboardMarkup]]:
+    markup = None
+    output = f"""
+**⏱ Uptime** : `{userge.uptime}`
+**💡 Version** : `{get_version()}`
+**⚙️ Mode** : `{_get_mode().upper()}`
+
+• **Sudo**: `{_parse_arg(Config.SUDO_ENABLED)}`
+• **Pm-Guard**: `{_parse_arg(not Config.ALLOW_ALL_PMS)}`
+• **Anti-Spam**: `{_parse_arg(Config.ANTISPAM_SENTRY)}`"""
+    if Config.HEROKU_APP:
+        output += f"\n• **Dyno-saver**: `{_parse_arg(Config.RUN_DYNO_SAVER)}`"
+    output += f"""
+• **Unofficial**: `{_parse_arg(Config.LOAD_UNOFFICIAL_PLUGINS)}`
+
+    **__Python__**: `{versions.__python_version__}`
+    **__Pyrogram__**: `{versions.__pyro_version__}`"""
+    if not message.client.is_bot:
+        output += f"""\n
+🎖 **{versions.__license__}** | 👥 **{versions.__copyright__}** | 🧪 **[Repo]({Config.UPSTREAM_REPO})**
+"""
+    else:
+        copy_ = "https://github.com/UsergeTeam/Userge/blob/master/LICENSE"
+        markup = InlineKeyboardMarkup([
+            [
+                InlineKeyboardButton(text="👥 UsergeTeam", url="https://github.com/UsergeTeam"),
+                InlineKeyboardButton(text="🧪 Repo", url=Config.UPSTREAM_REPO)
+            ],
+            [InlineKeyboardButton(text="🎖 GNU GPL v3.0", url=copy_)]
+        ])
+    return (output, markup)
 
 
 def _parse_arg(arg: bool) -> str:
-    return " ✅ 𝙴𝚗𝚊𝚋𝚕𝚎𝚍" if arg else " ❌ 𝙳𝚒𝚜𝚊𝚋𝚕𝚎𝚍"
+    return "enabled" if arg else "disabled"
 
 
-async def check_media_link(media_link: str):
-    alive_regex_ = r"http[s]?://(i\.imgur\.com|telegra\.ph/file|t\.me)/(\w+)(?:\.|/)(gif|jpg|png|jpeg|[0-9]+)(?:/([0-9]+))?"
-    match = search(alive_regex_, media_link)
-    if not match:
-        return None, None
-    if match.group(1) == "i.imgur.com":
-        link = match.group(0)
-        link_type = "url_gif" if match.group(3) == "gif" else "url_image"
-    elif match.group(1) == "telegra.ph/file":
-        link = match.group(0)
-        link_type = "url_image"
+async def _send_alive(message: Message,
+                      text: str,
+                      reply_markup: Optional[InlineKeyboardMarkup],
+                      recurs_count: int = 0) -> None:
+    if not (_LOGO_ID and _LOGO_REF):
+        await _refresh_id(message)
+    should_mark = None if _IS_STICKER else reply_markup
+    if _IS_TELEGRAPH:
+        await _send_telegraph(message, text, reply_markup)
     else:
-        link_type = "tg_media"
-        if match.group(2) == "c":
-            chat_id = int("-100" + str(match.group(3)))
-            message_id = match.group(4)
-        else:
-            chat_id = match.group(2)
-            message_id = match.group(3)
-        link = [chat_id, int(message_id)]
-    return link_type, link
+        try:
+            await message.client.send_cached_media(chat_id=message.chat.id,
+                                                   file_id=_LOGO_ID,
+                                                   file_ref=_LOGO_REF,
+                                                   caption=text,
+                                                   reply_markup=should_mark)
+            if _IS_STICKER:
+                raise ChatSendMediaForbidden
+        except SlowmodeWait as s_m:
+            await asyncio.sleep(s_m.x)
+            text = f'<b>{str(s_m).replace(" is ", " was ")}</b>\n\n{text}'
+            return await _send_alive(message, text, reply_markup)
+        except MediaEmpty:
+            if recurs_count >= 2:
+                raise ChatSendMediaForbidden
+            await _refresh_id(message)
+            return await _send_alive(message, text, reply_markup, recurs_count + 1)
+        except (ChatSendMediaForbidden, Forbidden):
+            await message.client.send_message(chat_id=message.chat.id,
+                                              text=text,
+                                              disable_web_page_preview=True,
+                                              reply_markup=should_mark)
+
+
+async def _refresh_id(message: Message) -> None:
+    global _LOGO_ID, _LOGO_REF, _IS_STICKER  # pylint: disable=global-statement
+    try:
+        media = await message.client.get_messages(_CHAT, _MSG_ID)
+    except (ChannelInvalid, PeerIdInvalid, ValueError):
+        _set_data(True)
+        return await _refresh_id(message)
+    else:
+        if media.sticker:
+            _IS_STICKER = True
+        _LOGO_ID, _LOGO_REF = get_file_id_and_ref(media)
+
+
+def _set_data(errored: bool = False) -> None:
+    global _CHAT, _MSG_ID, _IS_TELEGRAPH  # pylint: disable=global-statement
+
+    pattern_1 = r"^(http(?:s?):\/\/)?(www\.)?(t.me)(\/c\/(\d+)|:?\/(\w+))?\/(\d+)$"
+    pattern_2 = r"^https://telegra\.ph/file/\w+\.\w+$"
+    if Config.ALIVE_MEDIA and not errored:
+        if Config.ALIVE_MEDIA.lower().strip() == "nothing":
+            _CHAT = "text_format"
+            _MSG_ID = "text_format"
+            return
+        media_link = Config.ALIVE_MEDIA
+        match_1 = re.search(pattern_1, media_link)
+        match_2 = re.search(pattern_2, media_link)
+        if match_1:
+            _MSG_ID = int(match_1.group(7))
+            if match_1.group(5):
+                _CHAT = int("-100" + match_1.group(5))
+            elif match_1.group(6):
+                _CHAT = match_1.group(6)
+        elif match_2:
+            _IS_TELEGRAPH = True
+        elif "|" in Config.ALIVE_MEDIA:
+            _CHAT, _MSG_ID = Config.ALIVE_MEDIA.split("|", maxsplit=1)
+            _CHAT = _CHAT.strip()
+            _MSG_ID = int(_MSG_ID.strip())
+    else:
+        match = re.search(pattern_1, _DEFAULT)
+        _CHAT = match.group(6)
+        _MSG_ID = int(match.group(7))
+
+
+async def _send_telegraph(msg: Message, text: str, reply_markup: Optional[InlineKeyboardMarkup]):
+    path = os.path.join(Config.DOWN_PATH, os.path.split(Config.ALIVE_MEDIA)[1])
+    if not os.path.exists(path):
+        wget.download(Config.ALIVE_MEDIA, path)
+    if path.lower().endswith((".jpg", ".jpeg", ".png", ".bmp")):
+        await msg.client.send_photo(
+            chat_id=msg.chat.id,
+            photo=path,
+            caption=text,
+            reply_markup=reply_markup
+        )
+    elif path.lower().endswith((".mkv", ".mp4", ".webm")):
+        await msg.client.send_video(
+            chat_id=msg.chat.id,
+            video=path,
+            caption=text,
+            reply_markup=reply_markup
+        )
+    else:
+        await msg.client.send_document(
+            chat_id=msg.chat.id,
+            document=path,
+            caption=text,
+            reply_markup=reply_markup
+        )
